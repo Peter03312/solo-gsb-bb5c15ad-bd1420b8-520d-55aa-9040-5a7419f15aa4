@@ -13,7 +13,7 @@ from . import db
 from .audit import run_audit
 from .planner import Course, PlanError, build_plan, parse_semester
 from .program_plan import build_program_plan
-from .replan import replan_plan
+from .replan import replan_plan, replan_program_plan
 from .schemas import (AuditIn, CatalogIn, PlanIn, ProgramPlanIn, ReplanIn,
                       RequirementVersionIn, SeatCapIn)
 
@@ -648,6 +648,13 @@ def confirm_plan(plan_id: str):
 def replan_plan_route(plan_id: str, payload: ReplanIn):
     """已确认方案执行中途，凭已结束学期数与累计已修课程按当前目录滚动重排。
 
+    支持两类来源：
+    - 普通规划：沿用原目标课程、原每学期学分上限与剩余期限，按当前目录重排未来课表；
+    - 培养方案达成课表（``request.plan_type == "program_plan"``）：沿用原要求版本、
+      学分上限与期限；未来按当前目录（开课/先修/同修/席位）排课，要求归属及计入学分
+      仍按要求绑定目录计算，可重新选择拟修课及选修归属，并返回合并后的预计归属。
+      仅凭累计已修即达成时未来课表为空（草案仍保存，确认后撤换来源未来占位）。
+
     结果作为关联原方案的待确认草案（status=draft）保存；原方案及其历史目录不变。
     目录在计算至落库间被修订时，拒绝旧版本结果（409）且不保存。
     """
@@ -664,6 +671,7 @@ def replan_plan_route(plan_id: str, payload: ReplanIn):
 
         original_request = json.loads(row["request_json"])
         original_result = json.loads(row["result_json"])
+        is_program = original_request.get("plan_type") == "program_plan"
 
         version = db.get_current_version(conn)
         catalog = _to_catalog(db.load_courses(conn, version["id"]))
@@ -673,17 +681,53 @@ def replan_plan_route(plan_id: str, payload: ReplanIn):
         start_year, start_season = parse_semester(original_request["start_semester"])
         occupied = db.seat_occupied_map_for_replan(
             conn, plan_id, start_year, start_season, payload.elapsed_semesters)
+
+        attribution = None
         try:
-            effective_request, result, diff = replan_plan(
-                catalog,
-                original_request=original_request,
-                original_result=original_result,
-                elapsed_semesters=payload.elapsed_semesters,
-                completed=set(payload.completed_courses),
-                equiv_groups=equiv_groups,
-                seat_caps=seat_caps,
-                occupied=occupied,
-            )
+            if is_program:
+                rv = db.get_requirement_version(
+                    conn, original_request["requirement_version_id"])
+                if rv is None:
+                    # 防御：要求版本随快照引用仍可回看，缺失只可能是外部破坏
+                    raise HTTPException(status_code=404, detail={
+                        "code": "NOT_FOUND",
+                        "message": "来源课表绑定的要求版本 "
+                                   f"{original_request['requirement_version_id']} 不存在，"
+                                   "无法按培养方案达成课表重排"})
+                bound_rows = db.load_courses(conn, rv["catalog_version_id"])
+                bound_equiv = db.load_equiv_groups(conn, rv["catalog_version_id"])
+                content = json.loads(rv["content_json"])
+                effective_request, result, attribution_result, diff = replan_program_plan(
+                    bound_rows=bound_rows,
+                    bound_equiv_groups=bound_equiv,
+                    current_catalog=catalog,
+                    current_equiv_groups=equiv_groups,
+                    required=content["required_courses"],
+                    elective_groups=content["elective_groups"],
+                    original_request=original_request,
+                    original_result=original_result,
+                    elapsed_semesters=payload.elapsed_semesters,
+                    completed=set(payload.completed_courses),
+                    seat_caps=seat_caps,
+                    occupied=occupied,
+                )
+                attribution = {
+                    "requirement_version_id": rv["id"],
+                    "bound_catalog_version": rv["catalog_version_id"],
+                    "completed_courses": payload.completed_courses,
+                    "result": attribution_result,
+                }
+            else:
+                effective_request, result, diff = replan_plan(
+                    catalog,
+                    original_request=original_request,
+                    original_result=original_result,
+                    elapsed_semesters=payload.elapsed_semesters,
+                    completed=set(payload.completed_courses),
+                    equiv_groups=equiv_groups,
+                    seat_caps=seat_caps,
+                    occupied=occupied,
+                )
         except PlanError as exc:
             status = 400 if exc.code == "INVALID_INPUT" else 422
             raise HTTPException(status_code=status,
@@ -705,7 +749,10 @@ def replan_plan_route(plan_id: str, payload: ReplanIn):
             "completed_courses": payload.completed_courses,
             "difference": diff,
         }
+        if is_program:
+            replan_meta["plan_type"] = "program_plan"
         db.insert_draft(conn, draft_id, version["id"], effective_request, result,
-                        source_plan_id=plan_id, replan=replan_meta)
+                        source_plan_id=plan_id, replan=replan_meta,
+                        attribution=attribution)
         draft = db.get_plan(conn, draft_id)
     return _plan_out(draft)

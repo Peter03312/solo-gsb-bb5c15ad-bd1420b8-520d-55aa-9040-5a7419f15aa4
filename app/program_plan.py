@@ -5,6 +5,8 @@
 
 - **要求绑定目录版本**（bound）：决定课程是否互认、学分为何、拟修课能否计入学分；
   仅两版目录均有的课程可计入要求，绑定目录独有课程不在当前开课目录中，无法拟修。
+  已修课须存在于绑定目录或当前目录；仅绑定目录中的已修课参与要求归属，当前目录
+  独有的已修课（执行中途计划外修读）只作为排课的先修/同修基础、不计入学分。
 - **当前目录版本**（current）：决定未来课程的开课季节、先修、同修、排课学分与席位；
   当前目录独有课程只可作为先修/同修等必要课程随闭包排入，不计入任何要求项。
 
@@ -149,7 +151,9 @@ def build_program_plan(*, bound_rows, bound_equiv_groups, current_catalog,
     current_catalog: {code: Course}（当前目录，排课与先修/同修/开课季节以此为准）
     required / elective_groups: 要求版本内容（elective_groups 为
                    [{"name","candidates","min_credits"}]）
-    completed:     累计已修课程（必须存在于绑定目录；未知 -> COURSE_MISSING）
+    completed:     累计已修课程（须存在于绑定目录或当前目录，否则 COURSE_MISSING；
+                   仅绑定目录中的已修课参与要求归属，当前目录独有已修课只作为
+                   排课的先修/同修基础、不计入学分）
     """
     bound_credits = _credits_of(bound_rows)
     bound_equiv = _equiv_map(bound_equiv_groups)
@@ -157,11 +161,16 @@ def build_program_plan(*, bound_rows, bound_equiv_groups, current_catalog,
     completed = {c.strip().upper() for c in completed}
     start_year, start_season = parse_semester(start_semester)
 
-    # 已修课以“要求绑定目录”为准；未知已修课直接拒绝（不保存部分方案）
-    missing = sorted(c for c in completed if c not in bound_credits)
+    # 已修课须存在于“要求绑定目录”（可计入要求）或“当前目录”（执行中途计划外修读的
+    # 当前目录独有课，仅可作为后续拟修课的先修/同修基础）；两版目录均无 -> COURSE_MISSING。
+    missing = sorted(c for c in completed if c not in bound_credits and c not in current_catalog)
     if missing:
-        raise PlanError("COURSE_MISSING",
-                        f"课程缺失：{'、'.join(missing)} 不在要求版本绑定的目录版本中")
+        raise PlanError(
+            "COURSE_MISSING",
+            f"课程缺失：{'、'.join(missing)} 既不在要求版本绑定的目录版本中，"
+            "也不在当前目录版本中")
+    # 仅绑定目录中的已修课可参与要求归属；当前目录独有已修课只进入排课的先修/同修判定
+    bound_completed = completed & set(bound_credits)
 
     required = [r.strip().upper() for r in required]
     groups = [
@@ -172,8 +181,9 @@ def build_program_plan(*, bound_rows, bound_equiv_groups, current_catalog,
     elective_groups = [{"name": name, "candidates": cands, "min_credits": thr}
                        for cands, name, thr in groups]
 
-    # 快速路径：已修课程已使全部必修与选修门槛达成 -> 空课表（不落库）
-    quick = run_audit(bound_credits, bound_equiv_groups, required, elective_groups, completed)
+    # 快速路径：可计入的已修课程已使全部必修与选修门槛达成 -> 空课表（不落库）
+    quick = run_audit(bound_credits, bound_equiv_groups, required,
+                      elective_groups, bound_completed)
     if quick["achieved"]:
         return None, quick  # 调用方据此返回空课表
 
@@ -189,9 +199,9 @@ def build_program_plan(*, bound_rows, bound_equiv_groups, current_catalog,
                 "REQUIREMENT_CONFLICT",
                 f"必修课程 {r} 所在互认组（{'、'.join(sorted(unit))}）已被前序必修项占用，"
                 "同一互认组至多计入一门，无法达成")
-        if unit & completed:
+        if unit & bound_completed:
             consumed_units.add(unit)  # 已修同组课程满足本必修
-        elif (unit & shared_codes) - completed:
+        elif (unit & shared_codes) - bound_completed:
             consumed_units.add(unit)  # 可择一共有的未修课程拟修
         else:
             raise PlanError(
@@ -200,7 +210,7 @@ def build_program_plan(*, bound_rows, bound_equiv_groups, current_catalog,
                 "当前目录独有课程不能计入学分，无法达成")
 
     seeds = _enumerate_seed_sets(
-        shared_codes, completed, bound_equiv, required,
+        shared_codes, bound_completed, bound_equiv, required,
         [cands for cands, _, _ in groups])
 
     best = None                 # (k, seq, attribution)：最早完成 + 字典序最优
@@ -210,7 +220,7 @@ def build_program_plan(*, bound_rows, bound_equiv_groups, current_catalog,
     leaf_count = [0]
 
     def audit_of(courses):
-        merged = completed | set(courses)
+        merged = bound_completed | set(courses)
         return run_audit(bound_credits, bound_equiv_groups, required,
                          elective_groups, merged)
 
