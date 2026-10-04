@@ -80,7 +80,30 @@
     未知已修课程拒绝（422）且不留记录。
   - 现有规划、滚动重排、确认与席位行为保持兼容，不受影响。
 
-## 本轮新增（培养方案达成课表）
+## 本轮新增（培养方案达成课表的执行中途重排）
+
+- 已确认的**培养方案达成课表**执行中途，可凭**来源方案编号、已结束学期数、截至该时点的
+  累计已修课程**对剩余学期重排：`POST /plans/{id}/replan`（按来源方案类型自动分流），
+  另有显式入口 `POST /requirement-versions/{rv_id}/plans/{id}/replan`（额外校验方案归属）。
+- **沿用来源申请**的要求版本（含其绑定目录版本）、每学期学分上限与原期限；起始学期顺延、
+  学期数取剩余数。**未来**按**当前目录**的开课、先修、同修与席位约束排课，可重新选择
+  拟修课与选修归属；**要求归属及计入学分仍按要求绑定目录**计算（互认、归属、门槛学分）。
+- 累计已修**必须包含来源申请时声明的已修**（可含计划外提前修完的课程，撤销即
+  `COMPLETED_REVOKED`）；**已结束学期课表与占位不变，未来不重复安排已修课**。
+- 返回**最早达成**、同完成学期按各学期课程代码序列**字典序**择优的完整草案、合并累计已修
+  与拟修后的**预计归属**（`attribution`），以及与**原剩余课表**的逐学期/汇总差异；
+  仅凭累计已修即达成时草案的**未来课表为空**（仍落库，确认后释放来源未来占位）。
+- 草案 `status="draft"`、关联 `source_plan_id`、**不预占席位、不写审核**；确认沿用既有
+  `POST /plans/{id}/confirm` 契约：单事务原子复核**目录版本**与课表每门课每学期席位，
+  **仅替换来源方案未来占位**（已结束学期占位保留），同一来源**至多一个生效重排**，
+  目录在草案生成后修订返回 409，对已生效草案重复确认**幂等**。
+- 来源不是已确认的培养方案达成课表（显式入口 409）、已结束学期数不大于 0（422）或
+  不小于原规划学期数（400）、已修清单回退（422）、未知已修课（422）、期限内无解（422）
+  均拒绝且**不写入**；目录在计算至落库间被修订返回 409 且不保存。
+- 普通规划重排、达成审核、确认与席位接口行为保持兼容；普通重排草案不含
+  `attribution`/`plan_type` 字段。
+
+## 上一轮新增（培养方案达成课表）
 
 - 新增 **达成课表申请**：`POST /requirement-versions/{rv_id}/plans`，学生凭要求版本、
   累计已修课程、起始学期、每学期学分上限与规划学期数，求期限内最早达成全部必修与
@@ -157,7 +180,8 @@ Compose 通过命名卷 `planner-data` 持久化数据。
 | GET | `/plans` | 方案列表 |
 | GET | `/plans/{id}` | 回看方案（含绑定的目录版本号） |
 | POST | `/plans/{id}/confirm` | 确认方案/草案：事务内原子复核目录版本与每门课席位并占位；失败 409 回滚不超卖 |
-| POST | `/plans/{id}/replan` | 已确认方案执行中途滚动重排，生成关联草案（201，不占位） |
+| POST | `/plans/{id}/replan` | 已确认方案执行中途滚动重排（普通规划与培养方案达成课表按来源类型自动分流），生成关联草案（201，不占位） |
+| POST | `/requirement-versions/{rv_id}/plans/{id}/replan` | 培养方案达成课表执行中途重排的显式入口（额外校验方案归属该要求版本；契约同上） |
 | POST | `/programs/{program_code}/requirement-versions` | 登记培养方案要求版本（绑定既有目录版本；编号内版本号自增） |
 | GET | `/programs/requirement-versions` | 列出全部培养方案的要求版本 |
 | GET | `/programs/{program_code}/requirement-versions` | 列出某培养方案编号的全部要求版本 |
@@ -480,6 +504,101 @@ curl -X POST http://localhost:8000/requirement-versions/CS-BACH-2024:v1/plans \
 - 现有的规划、滚动重排、审核、确认与席位接口行为与数据结构保持兼容；普通规划
   响应不含 `attribution`/`plan_type` 字段。
 
+#### 培养方案达成课表的执行中途重排（本轮新增）
+
+已**确认**的达成课表执行到中途（实际完成与计划不同，或目录已修订）时，凭来源方案编号、
+已结束学期数与累计已修课程，对**剩余学期**重新求最早达成的完整未来课表。沿用来源申请的
+要求版本（绑定目录版本不变）、每学期学分上限与剩余学期数；**当前目录**管开课/先修/同修/
+席位，**要求绑定目录**管互认/归属/计入学分；可重新选择拟修课与选修归属。
+
+```bash
+# 通用入口：按来源方案类型自动分流（普通规划仍走原逻辑）
+curl -X POST http://localhost:8000/plans/<plan_id>/replan \
+  -H 'Content-Type: application/json' -d '{
+    "elapsed_semesters": 2,
+    "completed_courses": ["CS101","CS101L","CS201","CS301","CS303","MATH101","MATH103"]
+  }'
+
+# 显式入口：等价，另校验方案属于该要求版本
+curl -X POST http://localhost:8000/requirement-versions/CS-BACH-2024:v1/plans/<plan_id>/replan \
+  -H 'Content-Type: application/json' -d '{
+    "elapsed_semesters": 2,
+    "completed_courses": ["CS101","CS101L","CS201","CS301","CS303","MATH101","MATH103"]
+  }'
+```
+
+响应（201，节选）：草案结构与普通重排一致，并额外携带 `plan_type`、
+`requirement_version_id`、`bound_catalog_version` 与预计归属 `attribution`；
+`replan.difference` 是新课表与**原方案剩余学期**（跳过已结束学期）的逐学期差异。
+
+```json
+{
+  "plan_id": "b3d4a1c2e5f7",
+  "status": "draft",
+  "plan_type": "program_plan",
+  "catalog_version": 3,
+  "bound_catalog_version": 3,
+  "source_plan_id": "a91c0f7e2b44",
+  "request": {
+    "plan_type": "program_plan",
+    "requirement_version_id": "CS-BACH-2024:v1",
+    "bound_catalog_version": 3,
+    "completed_courses": ["CS101", "CS101L", "CS201", "CS301", "CS303", "MATH101", "MATH103"],
+    "start_semester": "2027-SPRING",
+    "max_credits_per_semester": 12,
+    "num_semesters": 4
+  },
+  "result": {
+    "completion_semester": "2027-FALL",
+    "total_credits": 3,
+    "semesters": [
+      {"semester": "2027-SPRING", "courses": [], "total_credits": 0},
+      {"semester": "2027-FALL", "courses": [{"code": "CS401", "credits": 3}], "total_credits": 3}
+    ]
+  },
+  "attribution": {
+    "requirement_version_id": "CS-BACH-2024:v1",
+    "bound_catalog_version": 3,
+    "completed_courses": ["..."],
+    "result": { "required": [ ], "elective_groups": [ ], "achieved": true }
+  },
+  "replan": {
+    "source_plan_id": "a91c0f7e2b44",
+    "elapsed_semesters": 2,
+    "completed_courses": ["..."],
+    "difference": {
+      "semesters": [
+        {"semester": "2027-FALL", "added_courses": ["CS401"], "removed_courses": []}
+      ],
+      "added_courses": ["CS401"],
+      "removed_courses": []
+    }
+  }
+}
+```
+
+规则与边界：
+
+- **累计已修须包含来源申请时的已修**：可新增计划外提前修完的课程（如经互认修了 CS302
+  而非 CS301，归属按绑定目录互认重新计为 CS301）；撤销来源声明的已修返回 422
+  `COMPLETED_REVOKED`，不保存。
+- **已结束学期课表与占位不变，未来不重复安排已修课**：原计划未来学期未修完的课程
+  （如选修 CS303）可重新择课，差异中体现为移除/新增。
+- **已达成即空未来课表**：累计已修已满足全部要求时仍返回 **201 草案**（`semesters=[]`、
+  `completion_semester=null`），供确认后**释放来源方案的未来占位**；预计归属照常返回。
+- **目录修订后重排**：新课表绑定当前目录（`catalog_version` 为新版本，课表学分按当前
+  目录），归属与门槛学分仍按要求版本绑定目录（`bound_catalog_version` 不变）。
+- **草案不预占席位**；确认沿用 `POST /plans/<draft_id>/confirm`：原子复核目录版本与席位，
+  **仅替换来源方案未来占位**（晚于 `elapsed_semesters` 的学期），已结束学期占位保留；
+  余量不足 409 `SEAT_CONFLICT` 整体回滚；同一来源至多一个生效重排（再确认其他草案 409
+  `DRAFT_EXPIRED`），重复确认已生效草案幂等。
+- 拒绝且不写入：来源不存在（404）、来源未确认或不是达成课表（显式入口 409
+  `PLAN_NOT_CONFIRMED`）、显式入口方案不属于路径要求版本（404）、
+  `elapsed_semesters <= 0`（422）或 `>= 原规划学期数`（400 `INVALID_INPUT`）、
+  未知已修课（422 `COURSE_MISSING`）、期限内无解（422 `NO_SOLUTION`，席位原因含已满
+  课程学期与上限/已占用）；目录在计算至落库间修订返回 409 `CATALOG_CHANGED`。
+- 已生效的重排草案仍可作为来源继续重排（链式），规则同上；普通规划的重排与草案结构不变。
+
 ### 调用示例
 
 生成规划：
@@ -773,8 +892,8 @@ curl -X POST http://localhost:8000/plans -H 'Content-Type: application/json' -d 
 | `NO_SOLUTION` | 422 | 无解：期限内无法排完（锁定安排、不可排课学期、学分上限/开课季节/先修顺序限制，含全部互认替代均不可行；席位余量不足时消息含已满的课程学期与上限/已占用） |
 | `TOO_COMPLEX` | 422 | 组合或搜索超出内置复杂度上限 |
 | `CATALOG_CHANGED` | 409 | 确认（或重排落库）时目录已修订，拒绝且不写入 |
-| `PLAN_NOT_CONFIRMED` | 409 | 对未确认方案发起滚动重排 |
-| `COMPLETED_REVOKED` | 422 | 累计已修撤销了原方案创建时声明的已修课程 |
+| `PLAN_NOT_CONFIRMED` | 409 | 对未确认方案发起滚动重排；或在培养方案显式重排入口提交非达成课表 |
+| `COMPLETED_REVOKED` | 422 | 累计已修撤销了原/来源方案创建时声明的已修课程 |
 | `CAP_BELOW_OCCUPIED` | 409 | 席位上限低于该 (课程,学期) 当前已占用席位，拒绝设置，原上限不变 |
 | `SEAT_CONFLICT` | 409 | 确认时原子复核席位发现余量不足，拒绝确认、事务回滚、原方案与原占位保留（不超卖） |
 | `DRAFT_EXPIRED` | 409 | 重排草案过期：来源方案不存在/未确认，或同一来源已有生效重排结果 |
@@ -789,7 +908,7 @@ app/
   planner.py    # 规划引擎（先修组枚举、互认替代、同修合并、锁定/不可排课/席位余量约束、回溯排课、字典序选优）
   replan.py     # 执行中途滚动重排（学期顺延、剩余学期课程差异、席位余量透传）
   audit.py      # 达成审核引擎（必修优先、互认去重、选修组优先级学分最大化、归属序列字典序决胜）
-  program_plan.py # 培养方案达成课表（绑定目录管互认/计入学分、当前目录管开课/先修/席位；枚举可达成选课集合后复用排课与审核）
+  program_plan.py # 培养方案达成课表及其执行中途重排（绑定目录管互认/计入学分、当前目录管开课/先修/席位；枚举可达成选课集合后复用排课与审核；重排顺延学期、校验已修超集并给出剩余课表差异）
   schemas.py    # 请求模型与校验（含互认组、席位上限、培养方案要求版本、达成审核与达成课表校验）
   db.py         # SQLite 持久化（目录版本、互认组、方案、重排草案、席位 seat_caps/seat_holds、要求版本 requirement_versions、审核 audits；方案 attribution_json 存预计归属）
   seed_data.py  # 种子课程目录（版本 1）

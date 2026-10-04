@@ -21,6 +21,7 @@ from __future__ import annotations
 from .audit import run_audit
 from .planner import (PlanError, _enumerate_sets, _equiv_map,
                       format_schedule, parse_semester, schedule_course_set)
+from .replan import next_semester_label, remaining_diff
 
 SEED_CAP = 50_000     # “满足要求的拟修选课”枚举递归调用上限，防止指数爆炸
 SEED_SET_CAP = 2048   # 去重后的拟修选课集合上限
@@ -260,3 +261,90 @@ def build_program_plan(*, bound_rows, bound_equiv_groups, current_catalog,
     k, seq, attribution = best
     schedule = format_schedule(current_catalog, start_year, start_season, k, seq)
     return schedule, attribution
+
+
+def _empty_remaining_schedule(message):
+    """剩余学期无需排课时的空课表结构（completion_semester 为 None）。"""
+    return {
+        "completion_semester": None,
+        "total_credits": 0,
+        "semesters": [],
+        "message": message,
+    }
+
+
+def build_program_replan(*, bound_rows, bound_equiv_groups, current_catalog,
+                         current_equiv_groups, required, elective_groups,
+                         original_request, original_result,
+                         elapsed_semesters, completed,
+                         seat_caps=None, occupied=None):
+    """已确认**培养方案达成课表**执行中途的滚动重排。
+
+    沿用来源申请的要求版本（由调用方按 original_request 解析后传入）、每学期学分上限
+    与原期限；从原起始学期顺延 elapsed_semesters 个学期后的下一学期起，在剩余学期数内，
+    按“当前目录”重新枚举可达成的拟修选课（可重选拟修课与选修归属），求最早完成 +
+    同完成学期字典序最优的未来课表，并按“要求绑定目录”计算合并累计已修与拟修后的
+    预计归属。
+
+    累计已修必须包含来源申请时声明的已修（COMPLETED_REVOKED）；
+    已结束学期数不大于 0 或不小于原规划学期数（INVALID_INPUT）。
+    仅凭累计已修即达成时，课表为“剩余学期空课表”——草案仍落库，供确认后释放
+    来源方案的未来占位。
+
+    返回 (effective_request, schedule, attribution, diff)；失败抛 PlanError，不返回部分课表。
+    参数语义与 build_program_plan、replan.replan_plan 一致。
+    """
+    num_semesters = int(original_request["num_semesters"])
+    max_credits = int(original_request["max_credits_per_semester"])
+    if elapsed_semesters <= 0 or elapsed_semesters >= num_semesters:
+        raise PlanError(
+            "INVALID_INPUT",
+            f"已结束学期数 {elapsed_semesters} 必须大于 0 且小于原规划期限 {num_semesters}")
+
+    declared = set(original_request.get("completed_courses", []))
+    completed = {c.strip().upper() for c in completed}
+    revoked = sorted(declared - completed)
+    if revoked:
+        raise PlanError(
+            "COMPLETED_REVOKED",
+            "累计已修课程不得撤销来源申请时声明的已修课程，缺少：" + "、".join(revoked))
+
+    remaining = num_semesters - elapsed_semesters
+    start_label = next_semester_label(original_request["start_semester"], elapsed_semesters)
+
+    # 已修课与计入学分仍按要求绑定目录（未知已修课的拒绝由 build_program_plan 统一给出）
+    schedule, attribution = build_program_plan(
+        bound_rows=bound_rows,
+        bound_equiv_groups=bound_equiv_groups,
+        current_catalog=current_catalog,
+        current_equiv_groups=current_equiv_groups,
+        required=required,
+        elective_groups=elective_groups,
+        completed=completed,
+        start_semester=start_label,
+        max_credits=max_credits,
+        num_semesters=remaining,
+        seat_caps=seat_caps,
+        occupied=occupied,
+    )
+    if schedule is None:
+        # 仅凭累计已修即达成全部要求：未来课表为空（已结束学期课表与占位保持不变）
+        schedule = _empty_remaining_schedule(
+            "累计已修课程已使全部必修与选修学分要求达成，剩余学期无需排课")
+        diff = remaining_diff(original_result, schedule, elapsed_semesters)
+    else:
+        diff = remaining_diff(original_result, schedule, elapsed_semesters)
+
+    effective_request = {
+        "plan_type": "program_plan",
+        "requirement_version_id": original_request["requirement_version_id"],
+        "bound_catalog_version": original_request["bound_catalog_version"],
+        "completed_courses": sorted(completed),
+        # 以全部拟修课程作为普通规划目标回看：可确认、可重放；达成语义以归属为准
+        "target_courses": sorted(
+            {c["code"] for s in schedule["semesters"] for c in s["courses"]}),
+        "start_semester": start_label,
+        "max_credits_per_semester": max_credits,
+        "num_semesters": remaining,
+    }
+    return effective_request, schedule, attribution, diff

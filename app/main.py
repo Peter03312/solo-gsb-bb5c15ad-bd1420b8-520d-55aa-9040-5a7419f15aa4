@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from . import db
 from .audit import run_audit
 from .planner import Course, PlanError, build_plan, parse_semester
-from .program_plan import build_program_plan
+from .program_plan import build_program_plan, build_program_replan
 from .replan import replan_plan
 from .schemas import (AuditIn, CatalogIn, PlanIn, ProgramPlanIn, ReplanIn,
                       RequirementVersionIn, SeatCapIn)
@@ -644,12 +644,132 @@ def confirm_plan(plan_id: str):
     return out
 
 
+def _create_normal_replan_draft(conn, row, payload):
+    """普通规划方案的滚动重排：沿用原目标课程与学分上限，按当前目录重排未来课表。"""
+    original_request = json.loads(row["request_json"])
+    original_result = json.loads(row["result_json"])
+
+    version = db.get_current_version(conn)
+    catalog = _to_catalog(db.load_courses(conn, version["id"]))
+    equiv_groups = db.load_equiv_groups(conn, version["id"])
+    seat_caps = db.load_seat_caps(conn)
+    # 重排余量：来源方案尚未结束学期的占位确认时会被替换，规划时不计入
+    start_year, start_season = parse_semester(original_request["start_semester"])
+    occupied = db.seat_occupied_map_for_replan(
+        conn, row["id"], start_year, start_season, payload.elapsed_semesters)
+    try:
+        effective_request, result, diff = replan_plan(
+            catalog,
+            original_request=original_request,
+            original_result=original_result,
+            elapsed_semesters=payload.elapsed_semesters,
+            completed=set(payload.completed_courses),
+            equiv_groups=equiv_groups,
+            seat_caps=seat_caps,
+            occupied=occupied,
+        )
+    except PlanError as exc:
+        raise _replan_http_error(exc)
+    _reject_stale_catalog(conn, version, "重排")
+    return _insert_replan_draft(
+        conn, row["id"], version["id"], effective_request, result, payload, diff)
+
+
+def _create_program_replan_draft(conn, row, payload):
+    """培养方案达成课表的执行中途重排：沿用要求版本与学分上限，按当前目录重新排未来课表。
+
+    要求归属及计入学分仍按要求绑定目录计算（可重选拟修课及选修归属）；当前目录决定
+    开课、先修、同修与席位。草案带预计归属（attribution），不写审核、不预占席位。
+    """
+    original_request = json.loads(row["request_json"])
+    original_result = json.loads(row["result_json"])
+    rv_id = original_request.get("requirement_version_id")
+    rv = db.get_requirement_version(conn, rv_id)
+    if rv is None:
+        # 来源方案引用的要求版本缺失：无法计算归属，拒绝且不写入
+        raise HTTPException(status_code=404, detail={
+            "code": "NOT_FOUND",
+            "message": f"来源方案引用的要求版本 {rv_id} 不存在，无法重排"})
+
+    version = db.get_current_version(conn)
+    catalog = _to_catalog(db.load_courses(conn, version["id"]))
+    current_equiv = db.load_equiv_groups(conn, version["id"])
+    bound_rows = db.load_courses(conn, rv["catalog_version_id"])
+    bound_equiv = db.load_equiv_groups(conn, rv["catalog_version_id"])
+    seat_caps = db.load_seat_caps(conn)
+    # 与普通重排一致：来源方案尚未结束学期的自身占位确认时将被替换，规划时不计入
+    start_year, start_season = parse_semester(original_request["start_semester"])
+    occupied = db.seat_occupied_map_for_replan(
+        conn, row["id"], start_year, start_season, payload.elapsed_semesters)
+    content = json.loads(rv["content_json"])
+    try:
+        effective_request, result, attribution, diff = build_program_replan(
+            bound_rows=bound_rows,
+            bound_equiv_groups=bound_equiv,
+            current_catalog=catalog,
+            current_equiv_groups=current_equiv,
+            required=content["required_courses"],
+            elective_groups=content["elective_groups"],
+            original_request=original_request,
+            original_result=original_result,
+            elapsed_semesters=payload.elapsed_semesters,
+            completed=set(payload.completed_courses),
+            seat_caps=seat_caps,
+            occupied=occupied,
+        )
+    except PlanError as exc:
+        raise _replan_http_error(exc)
+    _reject_stale_catalog(conn, version, "重排")
+    projected = {
+        "requirement_version_id": rv_id,
+        "bound_catalog_version": rv["catalog_version_id"],
+        "completed_courses": payload.completed_courses,
+        "result": attribution,
+    }
+    return _insert_replan_draft(
+        conn, row["id"], version["id"], effective_request, result, payload, diff,
+        attribution=projected)
+
+
+def _replan_http_error(exc):
+    status = 400 if exc.code == "INVALID_INPUT" else 422
+    return HTTPException(status_code=status,
+                         detail={"code": exc.code, "message": exc.message})
+
+
+def _reject_stale_catalog(conn, version, action):
+    """落库前复查：目录在计算期间被修订则拒绝旧版本结果（409，不保存）。"""
+    current = db.get_current_version(conn)
+    if current["id"] != version["id"]:
+        raise HTTPException(status_code=409, detail={
+            "code": "CATALOG_CHANGED",
+            "message": f"目录在{action}期间已修订（计算基于版本 {version['id']}，"
+                       f"当前版本 {current['id']}），旧版本结果被拒绝，请重新发起重排",
+        })
+
+
+def _insert_replan_draft(conn, source_id, version_id, effective_request, result,
+                         payload, diff, attribution=None):
+    draft_id = uuid.uuid4().hex[:12]
+    replan_meta = {
+        "source_plan_id": source_id,
+        "elapsed_semesters": payload.elapsed_semesters,
+        "completed_courses": payload.completed_courses,
+        "difference": diff,
+    }
+    db.insert_draft(conn, draft_id, version_id, effective_request, result,
+                    source_plan_id=source_id, replan=replan_meta,
+                    attribution=attribution)
+    return db.get_plan(conn, draft_id)
+
+
 @app.post("/plans/{plan_id}/replan", status_code=201)
 def replan_plan_route(plan_id: str, payload: ReplanIn):
     """已确认方案执行中途，凭已结束学期数与累计已修课程按当前目录滚动重排。
 
-    结果作为关联原方案的待确认草案（status=draft）保存；原方案及其历史目录不变。
-    目录在计算至落库间被修订时，拒绝旧版本结果（409）且不保存。
+    普通规划方案沿用原目标课程、培养方案达成课表沿用原要求版本与学分上限；结果均作为
+    关联原方案的待确认草案（status=draft）保存，原方案及其历史目录不变。目录在计算至
+    落库间被修订时，拒绝旧版本结果（409）且不保存。
     """
     with db.session() as conn:
         row = db.get_plan(conn, plan_id)
@@ -661,51 +781,34 @@ def replan_plan_route(plan_id: str, payload: ReplanIn):
                 "code": "PLAN_NOT_CONFIRMED",
                 "message": f"方案 {plan_id} 状态为 {row['status']}，仅已确认方案可滚动重排",
             })
+        is_program_plan = bool(row["attribution_json"])
+        if is_program_plan:
+            draft = _create_program_replan_draft(conn, row, payload)
+        else:
+            draft = _create_normal_replan_draft(conn, row, payload)
+    return _plan_out(draft)
 
-        original_request = json.loads(row["request_json"])
-        original_result = json.loads(row["result_json"])
 
-        version = db.get_current_version(conn)
-        catalog = _to_catalog(db.load_courses(conn, version["id"]))
-        equiv_groups = db.load_equiv_groups(conn, version["id"])
-        seat_caps = db.load_seat_caps(conn)
-        # 重排余量：来源方案尚未结束学期的占位确认时会被替换，规划时不计入
-        start_year, start_season = parse_semester(original_request["start_semester"])
-        occupied = db.seat_occupied_map_for_replan(
-            conn, plan_id, start_year, start_season, payload.elapsed_semesters)
-        try:
-            effective_request, result, diff = replan_plan(
-                catalog,
-                original_request=original_request,
-                original_result=original_result,
-                elapsed_semesters=payload.elapsed_semesters,
-                completed=set(payload.completed_courses),
-                equiv_groups=equiv_groups,
-                seat_caps=seat_caps,
-                occupied=occupied,
-            )
-        except PlanError as exc:
-            status = 400 if exc.code == "INVALID_INPUT" else 422
-            raise HTTPException(status_code=status,
-                                detail={"code": exc.code, "message": exc.message})
+@app.post("/requirement-versions/{rv_id}/plans/{plan_id}/replan", status_code=201)
+def replan_program_plan_route(rv_id: str, plan_id: str, payload: ReplanIn):
+    """培养方案达成课表执行中途滚动重排的显式入口（契约同 POST /plans/{id}/replan）。
 
-        # 落库前复查：目录在计算期间被修订则拒绝旧版本结果，不保存
-        current = db.get_current_version(conn)
-        if current["id"] != version["id"]:
+    额外校验路径中的要求版本与来源方案一致；来源不是该要求版本的已确认达成课表时拒绝。
+    """
+    with db.session() as conn:
+        row = db.get_plan(conn, plan_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND", "message": f"方案 {plan_id} 不存在"})
+        if row["status"] != "confirmed" or not row["attribution_json"]:
             raise HTTPException(status_code=409, detail={
-                "code": "CATALOG_CHANGED",
-                "message": f"目录在重排期间已修订（计算基于版本 {version['id']}，"
-                           f"当前版本 {current['id']}），旧版本结果被拒绝，请重新发起重排",
+                "code": "PLAN_NOT_CONFIRMED",
+                "message": f"方案 {plan_id} 不是已确认的培养方案达成课表，不可按要求版本重排",
             })
-
-        draft_id = uuid.uuid4().hex[:12]
-        replan_meta = {
-            "source_plan_id": plan_id,
-            "elapsed_semesters": payload.elapsed_semesters,
-            "completed_courses": payload.completed_courses,
-            "difference": diff,
-        }
-        db.insert_draft(conn, draft_id, version["id"], effective_request, result,
-                        source_plan_id=plan_id, replan=replan_meta)
-        draft = db.get_plan(conn, draft_id)
+        original_request = json.loads(row["request_json"])
+        if original_request.get("requirement_version_id") != rv_id:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND",
+                "message": f"方案 {plan_id} 不属于要求版本 {rv_id}"})
+        draft = _create_program_replan_draft(conn, row, payload)
     return _plan_out(draft)

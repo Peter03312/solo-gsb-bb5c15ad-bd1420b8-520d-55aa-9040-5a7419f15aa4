@@ -413,4 +413,110 @@ curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirement-versions/$RV_ID/pl
   -H 'Content-Type: application/json' -d '{"completed_courses":["UNKNOWN"],"start_semester":"2026-SPRING","max_credits_per_semester":12,"num_semesters":6}'
 curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirement-versions/$RV_ID/plans" \
   -H 'Content-Type: application/json' -d '{"completed_courses":[],"start_semester":"2026-SPRING","max_credits_per_semester":12,"num_semesters":2}'
+
+step "52. 达成课表执行中途重排：来源=步骤48已确认的 $PP_ID，已结束 2 学期且按计划修完"
+RPLAN=$(curl -s -X POST "$BASE/plans/$PP_ID/replan" \
+  -H 'Content-Type: application/json' -d '{
+    "elapsed_semesters": 2,
+    "completed_courses": ["CS101","CS101L","CS201","CS301","CS303","MATH101","MATH103"]
+  }')
+echo "$RPLAN" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('草案:', d['plan_id'], 'status:', d['status'], '来源:', d['source_plan_id'],
+      '类型:', d.get('plan_type'), '绑定目录:', d.get('bound_catalog_version'),
+      '当前目录:', d['catalog_version'])
+print('未来有效输入:', d['request']['start_semester'], '剩余', d['request']['num_semesters'], '学期')
+for s in d['result']['semesters']:
+    print(' ', s['semester'], [c['code'] for c in s['courses']], s['total_credits'], '学分')
+print('完成学期:', d['result']['completion_semester'], '预计达成:', d['attribution']['result']['achieved'])
+print('与原剩余课表差异:', d['replan']['difference'])
+"
+RPLAN_ID=$(echo "$RPLAN" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+echo "草案不预占席位（CS401@2027-FALL 的 occupied 不因草案增加；来源占位 CS401@2026-FALL 仍在）："
+curl -s "$BASE/seat-caps/CS401/2026-FALL"; echo
+
+step "53. 重排时改选拟修课：原第 1 学期选修 CS303 未修（显式入口，校验方案归属）"
+curl -s -X POST "$BASE/requirement-versions/$RV_ID/plans/$PP_ID/replan" \
+  -H 'Content-Type: application/json' -d '{
+    "elapsed_semesters": 2,
+    "completed_courses": ["CS101","CS101L","CS201","CS301","MATH101","MATH103"]
+  }' | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for s in d['result']['semesters']:
+    print(' ', s['semester'], [c['code'] for c in s['courses']])
+res=d['attribution']['result']
+for g in res['elective_groups']:
+    print(' 选修', g['name'], '计入', g['counted_credits'], '学分',
+          [(c['code'],c['via']) for c in g['attributed_courses']])
+print(' 差异:', d['replan']['difference'])
+"
+
+step "54. 确认步骤52草案：原子复核目录与席位，仅替换来源未来占位；重复确认幂等"
+echo "确认前 CS401@2027-FALL 占用："; curl -s "$BASE/seat-caps/CS401/2027-FALL"; echo
+curl -s -X POST "$BASE/plans/$RPLAN_ID/confirm" \
+  | python3 -c "import sys,json;print('首次确认:', json.load(sys.stdin)['status'])"
+curl -s -X POST "$BASE/plans/$RPLAN_ID/confirm" \
+  | python3 -c "import sys,json;print('重复确认:', json.load(sys.stdin)['status'])"
+echo "确认后 CS401@2027-FALL 增加 1（新课表占位）；CS401@2026-FALL 为已结束学期占位，保留："
+curl -s "$BASE/seat-caps/CS401/2027-FALL"; echo
+curl -s "$BASE/seat-caps/CS401/2026-FALL"; echo
+
+step "55. 已修即达成：重排草案未来课表为空，确认后释放来源未来占位；同来源第二草案过期"
+# 另建一份已确认达成课表作为本步来源（步骤52的来源已有生效重排）
+PP3=$(curl -s -X POST "$BASE/requirement-versions/$RV_ID/plans" \
+  -H 'Content-Type: application/json' -d '{
+    "completed_courses": ["CS101","CS101L","CS201","MATH101","MATH103"],
+    "start_semester": "2026-SPRING","max_credits_per_semester": 12,"num_semesters": 6}')
+PP3_ID=$(echo "$PP3" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+curl -s -X POST "$BASE/plans/$PP3_ID/confirm" \
+  | python3 -c "import sys,json;print('来源课表确认:', json.load(sys.stdin)['status'])"
+echo "确认前 CS401@2026-FALL 占用（来源未来占位）："
+curl -s "$BASE/seat-caps/CS401/2026-FALL"; echo
+EMPTY=$(curl -s -X POST "$BASE/plans/$PP3_ID/replan" \
+  -H 'Content-Type: application/json' -d '{
+    "elapsed_semesters": 2,
+    "completed_courses": ["CS101","CS101L","CS201","CS302","CS402","CS303","MATH101","MATH103"]
+  }')
+echo "$EMPTY" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('草案:', d['plan_id'], '未来课表:', d['result']['semesters'],
+      '完成学期:', d['result']['completion_semester'], '预计达成:', d['attribution']['result']['achieved'])
+"
+EMPTY_ID=$(echo "$EMPTY" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+# 同一来源再建一草案：先确认 EMPTY 生效后，该草案确认应 DRAFT_EXPIRED
+EXTRA=$(curl -s -X POST "$BASE/plans/$PP3_ID/replan" \
+  -H 'Content-Type: application/json' -d '{
+    "elapsed_semesters": 2,
+    "completed_courses": ["CS101","CS101L","CS201","CS302","CS402","CS303","MATH101","MATH103"]
+  }')
+EXTRA_ID=$(echo "$EXTRA" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+curl -s -X POST "$BASE/plans/$EMPTY_ID/confirm" \
+  | python3 -c "import sys,json;print('空未来课表草案确认:', json.load(sys.stdin)['status'])"
+echo "已结束学期占位保留（CS401@2026-FALL 为来源第 2 学期、序号 2 <= elapsed 2，占用不释放）："
+curl -s "$BASE/seat-caps/CS401/2026-FALL"; echo
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/plans/$EXTRA_ID/confirm" \
+  | python3 -c "
+import sys,json
+raw=sys.stdin.read()
+body, _, code = raw.rpartition('HTTP ')
+print('第二草案确认 HTTP', code.strip(), '->', json.loads(body)['detail']['code'])"
+
+step "56. 达成课表重排错误示例：未确认（409）、学期数越界（422/400）、已修回退（422）、方案不属于路径要求版本（404）"
+# 未确认的达成课表不可重排
+PP2=$(curl -s -X POST "$BASE/requirement-versions/$RV_ID/plans" \
+  -H 'Content-Type: application/json' -d '{"completed_courses":["CS101","CS101L","CS201","MATH101","MATH103"],"start_semester":"2030-SPRING","max_credits_per_semester":12,"num_semesters":6}')
+PP2_ID=$(echo "$PP2" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/plans/$PP2_ID/replan" \
+  -H 'Content-Type: application/json' -d '{"elapsed_semesters":1,"completed_courses":[]}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/plans/$PP_ID/replan" \
+  -H 'Content-Type: application/json' -d '{"elapsed_semesters":0,"completed_courses":[]}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/plans/$PP_ID/replan" \
+  -H 'Content-Type: application/json' -d '{"elapsed_semesters":6,"completed_courses":[]}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/plans/$PP_ID/replan" \
+  -H 'Content-Type: application/json' -d '{"elapsed_semesters":2,"completed_courses":["CS101","CS201","MATH101"]}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirement-versions/OTHER:v1/plans/$PP_ID/replan" \
+  -H 'Content-Type: application/json' -d '{"elapsed_semesters":2,"completed_courses":["CS101","CS101L","CS201","MATH101","MATH103"]}'
 echo done

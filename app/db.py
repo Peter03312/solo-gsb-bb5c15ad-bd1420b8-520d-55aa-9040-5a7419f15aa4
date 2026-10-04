@@ -222,14 +222,19 @@ def insert_plan(conn, plan_id, version_id, request, result, attribution=None):
     )
 
 
-def insert_draft(conn, plan_id, version_id, request, result, source_plan_id, replan):
-    """滚动重排草案：关联原方案并保存重排上下文与差异，状态为 draft。"""
+def insert_draft(conn, plan_id, version_id, request, result, source_plan_id, replan,
+                 attribution=None):
+    """滚动重排草案：关联原方案并保存重排上下文与差异，状态为 draft。
+
+    attribution 为培养方案达成课表重排的预计归属；普通重排草案为 NULL。
+    """
     conn.execute(
         "INSERT INTO plans (id, version_id, request_json, result_json, status, created_at,"
-        " source_plan_id, replan_json) VALUES (?,?,?,?,?,?,?,?)",
+        " source_plan_id, replan_json, attribution_json) VALUES (?,?,?,?,?,?,?,?,?)",
         (plan_id, version_id, json.dumps(request, ensure_ascii=False),
          json.dumps(result, ensure_ascii=False), "draft", _now(),
-         source_plan_id, json.dumps(replan, ensure_ascii=False)),
+         source_plan_id, json.dumps(replan, ensure_ascii=False),
+         json.dumps(attribution, ensure_ascii=False) if attribution is not None else None),
     )
 
 
